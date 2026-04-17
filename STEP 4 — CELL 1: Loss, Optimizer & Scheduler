@@ -1,0 +1,37 @@
+# ============================================================
+# STEP 4 — CELL 1: Loss, Optimizer & Scheduler
+# ============================================================
+
+# ── Weighted loss for class imbalance ──────────────────────
+class_counts = torch.tensor([
+    831, 415, 566, 106, 69, 210, 402, 101, 389
+], dtype=torch.float)
+class_weights = 1.0 / class_counts
+class_weights = class_weights / class_weights.sum()
+class_weights = class_weights.to(DEVICE)
+
+criterion = nn.CrossEntropyLoss(weight=class_weights)
+
+# ── AdamW with differential learning rates ─────────────────
+optimizer = AdamW([
+    # Pretrained backbones → lower lr
+    {'params': model.efficientnet.parameters(), 'lr': 1e-4},
+    {'params': model.swin.parameters(),         'lr': 1e-4},
+    # New layers → higher lr
+    {'params': model.eff_proj.parameters(),     'lr': 3e-4},
+    {'params': model.swin_proj.parameters(),    'lr': 3e-4},
+    # Cross attention → higher lr
+    {'params': model.cross_attention.parameters(),
+                                                'lr': 3e-4},
+    {'params': model.classifier.parameters(),   'lr': 3e-4},
+], weight_decay=1e-4)
+
+# ── Cosine annealing scheduler ─────────────────────────────
+scheduler = CosineAnnealingLR(
+    optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
+
+print("✅ Loss, optimizer & scheduler ready!")
+print("   Loss      : CrossEntropyLoss (weighted)")
+print("   Optimizer : AdamW (differential lr)")
+print("   Scheduler : CosineAnnealingLR")
+print(f"   Save path : {SAVE_PATH}")
