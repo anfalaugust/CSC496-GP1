@@ -1,0 +1,32 @@
+# ============================================================
+# STEP 5 — CELL 1: Load Best Model & Test
+# ============================================================
+
+model.load_state_dict(
+    torch.load(SAVE_PATH, map_location=DEVICE))
+model.eval()
+
+all_preds, all_labels_list = [], []
+
+with torch.no_grad():
+    for batch_idx, (images, labels) in enumerate(
+            test_loader):
+        images  = images.to(DEVICE)
+        outputs = model(images)
+        _, predicted = outputs.max(1)
+        all_preds.extend(predicted.cpu().numpy())
+        all_labels_list.extend(labels.numpy())
+        print(f"   Batch [{batch_idx+1}/"
+              f"{len(test_loader)}] ✅")
+
+all_preds       = np.array(all_preds)
+all_labels_list = np.array(all_labels_list)
+
+test_acc = (all_preds == all_labels_list).mean() * 100
+print(f"\n🎯 Test Accuracy: {test_acc:.2f}%\n")
+
+print(classification_report(
+    all_labels_list, all_preds,
+    target_names=SHORT_NAMES,
+    digits=4
+))
