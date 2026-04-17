@@ -1,0 +1,11 @@
+# ============================================================
+# STEP 1 — CELL 1: Mount Drive & Install Libraries
+# ============================================================
+from google.colab import drive
+drive.mount('/content/drive')
+
+!pip install timm -q
+!pip install torchinfo -q
+!pip install grad-cam -q
+
+print("✅ All libraries installed!")
