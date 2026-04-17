@@ -1,0 +1,40 @@
+# ============================================================
+# STEP 2 — CELL 1: Collect Paths & Split 70/15/15
+# ============================================================
+
+all_images, all_labels = [], []
+
+for cls in CLASS_NAMES:
+    cls_path = os.path.join(PROCESSED_PATH, cls)
+    for img_file in os.listdir(cls_path):
+        if img_file.lower().endswith(('.jpg','.jpeg','.png')):
+            all_images.append(os.path.join(cls_path, img_file))
+            all_labels.append(CLASS_TO_IDX[cls])
+
+print(f"📊 Total images: {len(all_images)}\n")
+
+# ── Class distribution ─────────────────────────────────────
+print("📂 Class distribution:")
+for cls in CLASS_NAMES:
+    count = all_labels.count(CLASS_TO_IDX[cls])
+    bar   = '█' * (count // 30)
+    print(f"   {cls:<35} {count:>4} {bar}")
+
+# ── Stratified split 70/15/15 ──────────────────────────────
+X_train, X_temp, y_train, y_temp = train_test_split(
+    all_images, all_labels,
+    test_size=0.30,
+    stratify=all_labels,
+    random_state=SEED
+)
+X_val, X_test, y_val, y_test = train_test_split(
+    X_temp, y_temp,
+    test_size=0.50,
+    stratify=y_temp,
+    random_state=SEED
+)
+
+print(f"\n✅ Split complete:")
+print(f"   Train : {len(X_train)} images (70%)")
+print(f"   Val   : {len(X_val)}   images (15%)")
+print(f"   Test  : {len(X_test)}  images (15%)")
