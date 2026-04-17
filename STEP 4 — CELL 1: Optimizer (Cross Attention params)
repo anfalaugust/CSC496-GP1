@@ -1,0 +1,18 @@
+# ============================================================
+# STEP 4 — CELL 1: Optimizer (Cross Attention params)
+# ============================================================
+
+optimizer = AdamW([
+    # Pretrained backbones → lower lr
+    {'params': model.efficientnet.parameters(), 'lr': 1e-4},
+    {'params': model.swin.parameters(),         'lr': 1e-4},
+    # New layers → higher lr
+    {'params': model.eff_proj.parameters(),     'lr': 3e-4},
+    {'params': model.swin_proj.parameters(),    'lr': 3e-4},
+    # Cross attention → higher lr
+    {'params': model.cross_attention.parameters(),
+                                                'lr': 3e-4},
+    {'params': model.classifier.parameters(),   'lr': 3e-4},
+], weight_decay=1e-4)
+
+print("✅ Optimizer updated for Cross Attention!")
