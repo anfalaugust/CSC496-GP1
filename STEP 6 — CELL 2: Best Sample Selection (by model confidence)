@@ -1,0 +1,41 @@
+# ============================================================
+# STEP 6 — CELL 2: Best Sample Selection (by model confidence)
+# ============================================================
+
+def get_best_sample(cls_path, class_idx, model, transform, device):
+    """
+    Returns (filename, confidence_score) for the image the model
+    predicts with highest softmax confidence for the given class.
+    Best samples produce the clearest GradCAM++ heatmaps.
+    """
+    files = [
+        f for f in os.listdir(cls_path)
+        if f.lower().endswith(('.jpg', '.jpeg', '.png'))
+    ]
+
+    if not files:
+        return None
+
+    best_file  = None
+    best_score = -1.0
+
+    model.eval()
+    with torch.no_grad():
+        for fname in files:
+            img_path = os.path.join(cls_path, fname)
+            try:
+                img    = Image.open(img_path).convert('RGB')
+                tensor = transform(img).unsqueeze(0).to(device)
+                probs  = torch.softmax(model(tensor), dim=1)
+                score  = probs[0][class_idx].item()
+                if score > best_score:
+                    best_score = score
+                    best_file  = fname
+            except Exception:
+                continue
+
+    return best_file, best_score
+
+
+print("✅ Sample selection ready!")
+print("   Strategy : highest model confidence (softmax) per class")
