@@ -1,0 +1,22 @@
+# ============================================================
+# STEP 3 — CELL 3: Instantiate & Verify Model
+# ============================================================
+
+model = HybridDatePalmModel(num_classes=NUM_CLASSES).to(DEVICE)
+
+# ── Quick forward pass ─────────────────────────────────────
+dummy = torch.randn(2, 3, 224, 224).to(DEVICE)
+with torch.no_grad():
+    out = model(dummy)
+
+print(f"✅ Forward pass successful!")
+print(f"   Input  : (2, 3, 224, 224)")
+print(f"   Output : {out.shape} ← should be (2, 9)")
+
+# ── Parameter count ────────────────────────────────────────
+total     = sum(p.numel() for p in model.parameters())
+trainable = sum(p.numel() for p in model.parameters()
+                if p.requires_grad)
+print(f"\n📊 Parameters:")
+print(f"   Total     : {total:,}")
+print(f"   Trainable : {trainable:,}")
