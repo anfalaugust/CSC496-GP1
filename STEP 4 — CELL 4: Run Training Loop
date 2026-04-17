@@ -1,0 +1,46 @@
+# ============================================================
+# STEP 4 — CELL 4: Run Training Loop
+# ============================================================
+
+history = {
+    'train_loss': [], 'train_acc': [],
+    'val_loss'  : [], 'val_acc'  : []
+}
+
+print("🚀 Starting training with Crpss-attention model...\n")
+print("=" * 60)
+
+for epoch in range(NUM_EPOCHS):
+    print(f"\n📅 Epoch [{epoch+1}/{NUM_EPOCHS}]")
+    print(f"   LR: {optimizer.param_groups[0]['lr']:.2e}")
+
+    train_loss, train_acc = train_one_epoch(
+        model, train_loader, optimizer, criterion, DEVICE)
+
+    val_loss, val_acc = validate(
+        model, val_loader, criterion, DEVICE)
+
+    scheduler.step()
+
+    history['train_loss'].append(train_loss)
+    history['train_acc'].append(train_acc)
+    history['val_loss'].append(val_loss)
+    history['val_acc'].append(val_acc)
+
+    print(f"   Train Loss: {train_loss:.4f} | "
+          f"Train Acc: {train_acc*100:.2f}%")
+    print(f"   Val Loss:   {val_loss:.4f}  | "
+          f"Val Acc:   {val_acc*100:.2f}%")
+
+    early_stopping(val_loss, val_acc, model, SAVE_PATH)
+
+    if early_stopping.should_stop:
+        print(f"\n🛑 Stopped at epoch {epoch+1}")
+        break
+
+    print("-" * 60)
+
+print(f"\n✅ Training complete!")
+print(f"   Best Val Accuracy : "
+      f"{early_stopping.best_acc*100:.2f}%")
+print(f"   Model saved to    : {SAVE_PATH}")
