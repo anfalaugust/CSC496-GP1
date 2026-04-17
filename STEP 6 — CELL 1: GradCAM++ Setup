@@ -1,0 +1,18 @@
+# ============================================================
+# STEP 6 — CELL 1: GradCAM++ Setup
+# ============================================================
+# pip install grad-cam
+from pytorch_grad_cam                    import GradCAMPlusPlus
+from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+from pytorch_grad_cam.utils.image        import show_cam_on_image
+import cv2
+
+# ── Target layer (last block of EfficientNet branch) ───────
+target_layer = [model.efficientnet.blocks[4][-1]]
+gradcam      = GradCAMPlusPlus(
+    model        = model,
+    target_layers= target_layer
+)
+
+print("✅ GradCAM++ ready (pytorch-grad-cam library)!")
+print(f"   Target layer : efficientnet.blocks[4][-1]")
