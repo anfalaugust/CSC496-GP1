@@ -1,0 +1,27 @@
+# ============================================================
+# STEP 1 — CELL 2: All Imports
+# ============================================================
+import os
+import random
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
+import warnings
+warnings.filterwarnings("ignore")
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+import torchvision.transforms as transforms
+import timm
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (classification_report,
+                             confusion_matrix)
+import seaborn as sns
+from torchinfo import summary
+
+print("✅ All imports done!")
