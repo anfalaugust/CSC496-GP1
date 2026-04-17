@@ -1,0 +1,28 @@
+# ============================================================
+# STEP 5 — CELL 2: Confusion Matrix
+# ============================================================
+
+cm = confusion_matrix(all_labels_list, all_preds)
+
+plt.figure(figsize=(12, 10))
+sns.heatmap(
+    cm,
+    annot=True,
+    fmt='d',
+    cmap='Blues',
+    xticklabels=SHORT_NAMES,
+    yticklabels=SHORT_NAMES,
+    linewidths=0.5
+)
+plt.title(f'Confusion Matrix — Test Set '
+          f'({test_acc:.2f}%)',
+          fontsize=14, fontweight='bold', pad=15)
+plt.ylabel('True Label',      fontsize=12)
+plt.xlabel('Predicted Label', fontsize=12)
+plt.xticks(rotation=45, ha='right', fontsize=9)
+plt.yticks(rotation=0,           fontsize=9)
+plt.tight_layout()
+plt.savefig(f'{PLOTS_PATH}/confusion_matrix_cbam.png',
+            dpi=150)
+plt.show()
+print("✅ Confusion matrix saved!")
