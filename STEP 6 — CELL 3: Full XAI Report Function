@@ -1,0 +1,247 @@
+# ============================================================
+# STEP 6 — CELL 3: Full XAI Report Function
+# ============================================================
+
+def generate_xai_report(image_path, model, gradcam,
+                         transform, class_names, device,
+                         save_path=None):
+    try:
+        # ── Load image ─────────────────────────────────────
+        orig_img = Image.open(image_path).convert('RGB')
+        orig_u8  = np.array(orig_img).astype(np.uint8)
+        orig_f32 = orig_u8.astype(np.float32) / 255.0
+        h, w     = orig_u8.shape[:2]
+
+        input_tensor = transform(orig_img).unsqueeze(0).to(device)
+
+        # ── Inference ──────────────────────────────────────
+        model.eval()
+        with torch.no_grad():
+            output = model(input_tensor)
+            probs  = torch.softmax(output, dim=1)[0]
+
+        conf, idx  = probs.max(0)
+        pred_cls   = class_names[idx.item()].split('. ')[1]
+        confidence = conf.item() * 100
+        probs_np   = probs.cpu().numpy()
+        top3_idx   = probs_np.argsort()[::-1][:3]
+
+        # ── GradCAM++ via library ──────────────────────────
+        targets  = [ClassifierOutputTarget(idx.item())]
+        cam_raw  = gradcam(
+            input_tensor = input_tensor,
+            targets      = targets
+        )                                   # shape: (1, H_feat, W_feat)
+        cam_resized = cv2.resize(
+            cam_raw[0], (w, h),
+            interpolation=cv2.INTER_CUBIC
+        )                                   # already normalized [0, 1]
+
+        # ── Percentile stretch for contrast ────────────────
+        p_low  = np.percentile(cam_resized, 10)
+        p_high = np.percentile(cam_resized, 90)
+        cam_s  = np.clip(
+            (cam_resized - p_low) / (p_high - p_low + 1e-8),
+            0, 1
+        )
+
+        # ── XAI metrics ────────────────────────────────────
+        threshold      = np.percentile(cam_s, 75)
+        binary_mask    = (cam_s >= threshold).astype(np.uint8) * 255
+        kernel         = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (9, 9))
+        binary_mask    = cv2.morphologyEx(
+            binary_mask, cv2.MORPH_CLOSE, kernel)
+        binary_mask    = cv2.morphologyEx(
+            binary_mask, cv2.MORPH_OPEN,  kernel)
+        contours, _    = cv2.findContours(
+            binary_mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE)
+        min_area       = (h * w) * 0.005
+        contours       = [c for c in contours
+                          if cv2.contourArea(c) > min_area]
+        activated_area = np.sum(cam_s >= threshold)
+        coverage_pct   = (activated_area / (h * w)) * 100
+        mean_intensity = (cam_s[cam_s >= threshold].mean()
+                          if activated_area > 0 else 0)
+        n_regions      = len(contours)
+
+        # ── Overlay & contour ──────────────────────────────
+        overlay     = show_cam_on_image(
+            orig_f32, cam_s, use_rgb=True)  # returns uint8 RGB
+        contour_img = orig_u8.copy()
+        cv2.drawContours(
+            contour_img, contours, -1, (255, 0, 0), 3)
+
+        # ── Disease descriptions ───────────────────────────
+        disease_explanations = {
+            'Potassium Deficiency' :
+                'orange/yellow leaf margins and tips',
+            'Manganese Deficiency' :
+                'yellowing between leaf veins',
+            'Magnesium Deficiency' :
+                'interveinal chlorosis patterns',
+            'Black Scorch'         :
+                'dark black scorched tissue areas',
+            'Leaf Spots'           :
+                'circular brown/yellow spot lesions',
+            'Fusarium Wilt'        :
+                'wilted and discolored vascular tissue',
+            'Rachis Blight'        :
+                'browning along the rachis stem',
+            'Parlatoria Blanchardi':
+                'white/grey scale insect clusters',
+            'Healthy sample'       :
+                'uniform green healthy tissue',
+        }
+        visual_desc = disease_explanations.get(
+            pred_cls, 'disease-specific patterns')
+        top2_wrong  = [
+            class_names[i].split('. ')[1]
+            for i in top3_idx[1:3]
+        ]
+
+        # ── Figure ─────────────────────────────────────────
+        fig = plt.figure(figsize=(18, 10))
+        fig.patch.set_facecolor('#f8f9fa')
+        fig.suptitle(
+            f'XAI Report — {pred_cls}',
+            fontsize=16, fontweight='bold', y=0.98)
+
+        # Panel 1 — Original
+        ax1 = fig.add_subplot(2, 4, 1)
+        ax1.imshow(orig_u8)
+        ax1.set_title('Original Image',
+                      fontweight='bold', fontsize=10)
+        ax1.axis('off')
+
+        # Panel 2 — Heatmap overlay
+        ax2 = fig.add_subplot(2, 4, 2)
+        ax2.imshow(overlay)
+        ax2.set_title('GradCAM++ Heatmap',
+                      fontweight='bold', fontsize=10)
+        ax2.axis('off')
+
+        # Panel 3 — Disease regions
+        ax3 = fig.add_subplot(2, 4, 3)
+        ax3.imshow(contour_img)
+        ax3.set_title('Disease Regions',
+                      fontweight='bold', fontsize=10)
+        ax3.axis('off')
+
+        # Panel 4 — Raw activation map
+        ax4 = fig.add_subplot(2, 4, 4)
+        ax4.imshow(cam_s, cmap='jet')
+        ax4.set_title('Activation Map',
+                      fontweight='bold', fontsize=10)
+        ax4.axis('off')
+
+        # Panel 5 — Bar chart
+        ax5    = fig.add_subplot(2, 4, 5)
+        short  = [c.split('. ')[1][:12] for c in class_names]
+        colors_bar = [
+            '#e74c3c' if i == idx.item() else '#bdc3c7'
+            for i in range(len(class_names))
+        ]
+        bars = ax5.barh(
+            short, probs_np * 100,
+            color=colors_bar, edgecolor='white')
+        ax5.set_xlabel('Confidence (%)', fontsize=9)
+        ax5.set_title('Class Probabilities',
+                      fontweight='bold', fontsize=10)
+        ax5.set_xlim(0, 105)
+        for bar, val in zip(bars, probs_np * 100):
+            if val > 1:
+                ax5.text(
+                    val + 0.5,
+                    bar.get_y() + bar.get_height() / 2,
+                    f'{val:.1f}%',
+                    va='center', fontsize=8)
+        ax5.grid(axis='x', alpha=0.3)
+
+        # Panel 6 — XAI metrics
+        ax6 = fig.add_subplot(2, 4, 6)
+        ax6.axis('off')
+        metrics_text = (
+            f"📊  XAI METRICS\n"
+            f"{'─'*28}\n\n"
+            f"   Prediction\n"
+            f"    {pred_cls}\n\n"
+            f"   Confidence\n"
+            f"    {confidence:.1f}%\n\n"
+            f"   Active Regions\n"
+            f"    {n_regions} distinct area(s)\n\n"
+            f"   Coverage\n"
+            f"    {coverage_pct:.1f}% of leaf\n\n"
+            f"✱  Intensity\n"
+            f"    {mean_intensity:.3f} (mean)\n"
+        )
+        ax6.text(
+            0.05, 0.95, metrics_text,
+            transform=ax6.transAxes,
+            fontsize=10, verticalalignment='top',
+            fontfamily='monospace',
+            bbox=dict(boxstyle='round',
+                      facecolor='#ecf0f1',
+                      alpha=0.8))
+
+        # Panel 7+8 — Written explanation
+        ax7 = fig.add_subplot(2, 4, (7, 8))
+        ax7.axis('off')
+        explanation = (
+            f"MODEL EXPLANATION\n"
+            f"{'─'*45}\n\n"
+            f"The model identified this leaf as "
+            f"{pred_cls}\n"
+            f"with {confidence:.1f}% confidence.\n\n"
+            f"VISUAL EVIDENCE:\n"
+            f"  • GradCAM++ detected {n_regions} "
+            f"high-activation region(s)\n"
+            f"  • Activated area covers "
+            f"{coverage_pct:.1f}% of the leaf\n"
+            f"  • Model focused on: {visual_desc}\n\n"
+            f"DECISION BASIS:\n"
+            f"  • Mean activation intensity: "
+            f"{mean_intensity:.3f}\n"
+            f"  • Next candidates: "
+            f"{top2_wrong[0]} "
+            f"({probs_np[top3_idx[1]]*100:.1f}%), "
+            f"{top2_wrong[1]} "
+            f"({probs_np[top3_idx[2]]*100:.1f}%)\n\n"
+            f"RELIABILITY: "
+            f"{'HIGH ✅' if confidence >= 90 else 'MODERATE ⚠️'}"
+            f" — model is "
+            f"{'very confident' if confidence >= 90 else 'uncertain'}"
+            f" in this prediction"
+        )
+        ax7.text(
+            0.02, 0.95, explanation,
+            transform=ax7.transAxes,
+            fontsize=10, verticalalignment='top',
+            fontfamily='monospace',
+            bbox=dict(boxstyle='round',
+                      facecolor='#eafaf1',
+                      alpha=0.9))
+
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(
+                save_path, dpi=150,
+                bbox_inches='tight',
+                facecolor='#f8f9fa')
+            print(f"   💾 Saved: {save_path}")
+
+        plt.show()
+        plt.close()
+        return cam_s, pred_cls, confidence
+
+    except Exception:
+        import traceback
+        print("   ❌ Error inside generate_xai_report:")
+        traceback.print_exc()
+        return None, None, None          # safe unpack in Cell 4
+
+
+print("✅ XAI report function ready!")
