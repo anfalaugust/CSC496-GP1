@@ -1,0 +1,50 @@
+# ============================================================
+# STEP 6 — CELL 4: Run XAI Report for All 9 Classes
+# ============================================================
+
+print("📋 Generating XAI Reports for all 9 classes...\n")
+print("=" * 55)
+
+for cls in CLASS_NAMES:
+    cls_path  = os.path.join(PROCESSED_PATH, cls)
+    cls_short = cls.split('. ')[1].replace(' ', '_')
+    cls_idx   = int(cls.split('.')[0]) - 1   # "1. Healthy" → 0
+
+    result = get_best_sample(
+        cls_path  = cls_path,
+        class_idx = cls_idx,
+        model     = model,
+        transform = val_test_transform,
+        device    = DEVICE
+    )
+
+    if result is None:
+        print(f"⚠️  Skipping {cls_short} — no images found")
+        continue
+
+    fname, sample_conf = result
+    img_path = os.path.join(cls_path, fname)
+
+    print(f"\n📸 {cls.split('. ')[1]}")
+    print(f"   Selected : {fname}")
+    print(f"   Sample confidence : {sample_conf*100:.1f}%")
+
+    cam, pred, conf = generate_xai_report(
+        image_path  = img_path,
+        model       = model,
+        gradcam     = gradcam,
+        transform   = val_test_transform,
+        class_names = CLASS_NAMES,
+        device      = DEVICE,
+        save_path   = f'{RESULTS_PATH}/xai_report_{cls_short}.png'
+    )
+
+    if pred is None:
+        print(f"   ⚠️  Report failed for {cls_short}, skipping.")
+        continue
+
+    status = '✅' if pred == cls.split('. ')[1] else '❌'
+    print(f"   {status} Predicted: {pred} ({conf:.1f}%)")
+
+print("\n" + "=" * 55)
+print("✅ All XAI reports done!")
