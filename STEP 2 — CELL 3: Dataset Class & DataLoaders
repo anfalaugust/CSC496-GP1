@@ -1,0 +1,67 @@
+# ============================================================
+# STEP 2 — CELL 3: Dataset Class & DataLoaders
+# ============================================================
+
+class DatePalmDataset(Dataset):
+    def __init__(self, image_paths, labels, transform=None):
+        self.image_paths = image_paths
+        self.labels      = labels
+        self.transform   = transform
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img = Image.open(
+            self.image_paths[idx]).convert('RGB')
+        if self.transform:
+            img = self.transform(img)
+        return img, self.labels[idx]
+
+
+# ── Weighted sampler for class imbalance ───────────────────
+def make_weighted_sampler(labels):
+    class_counts  = np.bincount(labels)
+    class_weights = 1.0 / class_counts
+    sample_weights = [class_weights[l] for l in labels]
+    return WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True
+    )
+
+# ── Build datasets ─────────────────────────────────────────
+train_dataset = DatePalmDataset(
+    X_train, y_train, train_transform)
+val_dataset   = DatePalmDataset(
+    X_val,   y_val,   val_test_transform)
+test_dataset  = DatePalmDataset(
+    X_test,  y_test,  val_test_transform)
+
+# ── Build dataloaders ──────────────────────────────────────
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=BATCH_SIZE,
+    sampler=make_weighted_sampler(y_train),
+    num_workers=NUM_WORKERS,
+    pin_memory=True
+)
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    num_workers=NUM_WORKERS,
+    pin_memory=True
+)
+test_loader = DataLoader(
+    test_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    num_workers=NUM_WORKERS,
+    pin_memory=True
+)
+
+print("✅ Datasets & DataLoaders ready!")
+print(f"   Train batches : {len(train_loader)}")
+print(f"   Val batches   : {len(val_loader)}")
+print(f"   Test batches  : {len(test_loader)}")
