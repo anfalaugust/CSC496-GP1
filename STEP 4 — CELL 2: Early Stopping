@@ -1,0 +1,32 @@
+# ============================================================
+# STEP 4 — CELL 2: Early Stopping
+# ============================================================
+
+class EarlyStopping:
+    def __init__(self, patience=7, min_delta=0.001):
+        self.patience    = patience
+        self.min_delta   = min_delta
+        self.counter     = 0
+        self.best_acc    = 0.0
+        self.best_loss   = float('inf')
+        self.should_stop = False
+
+    def __call__(self, val_loss, val_acc,
+                 model, path):
+        if val_acc > self.best_acc + self.min_delta:
+            self.best_acc  = val_acc
+            self.best_loss = val_loss
+            self.counter   = 0
+            torch.save(model.state_dict(), path)
+            print(f"   💾 Best model saved! "
+                  f"(val_acc={val_acc*100:.2f}%)")
+        else:
+            self.counter += 1
+            print(f"   ⏳ No improvement "
+                  f"({self.counter}/{self.patience})")
+            if self.counter >= self.patience:
+                self.should_stop = True
+                print(f"   🛑 Early stopping triggered!")
+
+early_stopping = EarlyStopping(patience=7, min_delta=0.001)
+print("✅ Early stopping ready! (patience=7)")
