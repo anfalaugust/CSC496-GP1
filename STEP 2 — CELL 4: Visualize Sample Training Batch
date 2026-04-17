@@ -1,0 +1,27 @@
+# ============================================================
+# STEP 2 — CELL 4: Visualize Sample Training Batch
+# ============================================================
+
+def unnormalize(tensor):
+    img = tensor.numpy().transpose((1, 2, 0))
+    img = img * np.array([0.229, 0.224, 0.225]) + \
+               np.array([0.485, 0.456, 0.406])
+    return np.clip(img, 0, 1)
+
+images, labels = next(iter(train_loader))
+
+fig, axes = plt.subplots(2, 8, figsize=(20, 6))
+fig.suptitle('Sample Training Batch (after augmentation)',
+             fontsize=13, fontweight='bold')
+
+for i, ax in enumerate(axes.flatten()):
+    if i < len(images):
+        ax.imshow(unnormalize(images[i]))
+        ax.set_title(SHORT_NAMES[labels[i]][:12],
+                     fontsize=7)
+        ax.axis('off')
+
+plt.tight_layout()
+plt.savefig(f'{PLOTS_PATH}/sample_batch.png', dpi=150)
+plt.show()
+print("✅ Sample batch visualized!")
