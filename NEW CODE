@@ -1,0 +1,1293 @@
+# ============================================================
+# ⚡ QUICK RESTART (v2 BCAF) — Run this after any disconnection
+# ============================================================
+# Includes: data setup + new BCAF architecture + model instantiation
+# After this cell runs, ALL other cells (Step 4, Step 5, etc.) work.
+# ============================================================
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+!pip install timm torchinfo grad-cam shap -q
+
+# ── Imports ────────────────────────────────────────────────
+import os, random, time, zipfile, warnings
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+import torchvision.transforms as transforms
+
+import timm
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
+import seaborn as sns
+import cv2
+
+warnings.filterwarnings("ignore")
+
+# ── Reproducibility ────────────────────────────────────────
+SEED = 42
+random.seed(SEED); np.random.seed(SEED)
+torch.manual_seed(SEED); torch.cuda.manual_seed(SEED)
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# ── Paths (match your full code) ───────────────────────────
+DATASET_ROOT   = '/content/dataset/Diseases of date palm leaves dataset/Infected Date Palm Leaves Dataset'
+PROCESSED_PATH = f'{DATASET_ROOT}/Processed'
+RAW_PATH       = f'{DATASET_ROOT}/Raw'
+
+GP1_PATH     = '/content/drive/MyDrive/GP1'
+MODEL_PATH   = f'{GP1_PATH}/Model'
+PLOTS_PATH   = f'{GP1_PATH}/Plots'
+RESULTS_PATH = f'{GP1_PATH}/Results'
+SAVE_PATH    = f'{MODEL_PATH}/EffSwin.pth'   
+
+ZIP_PATH     = '/content/drive/MyDrive/CSC496/Diseases of date palm leaves dataset.zip'
+EXTRACT_DIR  = '/content/dataset'
+
+for path in [MODEL_PATH, PLOTS_PATH, RESULTS_PATH]:
+    os.makedirs(path, exist_ok=True)
+
+# ── Hyperparameters ────────────────────────────────────────
+IMG_SIZE    = 224
+BATCH_SIZE  = 32
+NUM_CLASSES = 9
+NUM_WORKERS = 2
+NUM_EPOCHS  = 30
+
+# ── Class names ────────────────────────────────────────────
+CLASS_NAMES = [
+    '1. Potassium Deficiency','2. Manganese Deficiency',
+    '3. Magnesium Deficiency','4. Black Scorch',
+    '5. Leaf Spots','6. Fusarium Wilt',
+    '7. Rachis Blight','8. Parlatoria Blanchardi',
+    '9. Healthy sample'
+]
+CLASS_TO_IDX = {cls: idx for idx, cls in enumerate(CLASS_NAMES)}
+SHORT_NAMES  = [c.split('. ')[1] for c in CLASS_NAMES]
+
+# ── Extract dataset to local Colab disk if needed ──────────
+if os.path.exists(EXTRACT_DIR) and len(os.listdir(EXTRACT_DIR)) > 0:
+    print(f"✅ Dataset already extracted at {EXTRACT_DIR}")
+else:
+    os.makedirs(EXTRACT_DIR, exist_ok=True)
+    print("📦 Extracting dataset (3-5 min)...")
+    t0 = time.time()
+    with zipfile.ZipFile(ZIP_PATH, 'r') as z:
+        z.extractall(EXTRACT_DIR)
+    print(f"✅ Extracted in {time.time()-t0:.1f}s")
+
+# ── Transforms (match Step 2 Cell 2) ───────────────────────
+val_test_transform = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485,0.456,0.406], [0.229,0.224,0.225])
+])
+train_transform = transforms.Compose([
+    transforms.RandomResizedCrop(IMG_SIZE, scale=(0.85, 1.0)),
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomVerticalFlip(p=0.3),
+    transforms.RandomRotation(degrees=30),
+    transforms.ColorJitter(0.2, 0.2, 0.1, 0.05),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485,0.456,0.406], [0.229,0.224,0.225])
+])
+
+# ── Dataset class ──────────────────────────────────────────
+class DatePalmDataset(Dataset):
+    def __init__(self, image_paths, labels, transform=None):
+        self.image_paths = image_paths
+        self.labels      = labels
+        self.transform   = transform
+    def __len__(self):
+        return len(self.image_paths)
+    def __getitem__(self, idx):
+        img = Image.open(self.image_paths[idx]).convert('RGB')
+        if self.transform: img = self.transform(img)
+        return img, self.labels[idx]
+
+# ── Build splits ───────────────────────────────────────────
+all_images, all_labels = [], []
+for cls in CLASS_NAMES:
+    cls_path = os.path.join(PROCESSED_PATH, cls)
+    for f in os.listdir(cls_path):
+        if f.lower().endswith(('.jpg','.jpeg','.png')):
+            all_images.append(os.path.join(cls_path, f))
+            all_labels.append(CLASS_TO_IDX[cls])
+
+X_train, X_temp, y_train, y_temp = train_test_split(
+    all_images, all_labels, test_size=0.30,
+    stratify=all_labels, random_state=SEED)
+X_val, X_test, y_val, y_test = train_test_split(
+    X_temp, y_temp, test_size=0.50,
+    stratify=y_temp, random_state=SEED)
+
+# ── Weighted sampler ───────────────────────────────────────
+def make_weighted_sampler(labels):
+    cw = 1.0 / np.bincount(labels)
+    sw = [cw[l] for l in labels]
+    return WeightedRandomSampler(sw, len(sw), replacement=True)
+
+train_dataset = DatePalmDataset(X_train, y_train, train_transform)
+val_dataset   = DatePalmDataset(X_val,   y_val,   val_test_transform)
+test_dataset  = DatePalmDataset(X_test,  y_test,  val_test_transform)
+
+train_loader = DataLoader(train_dataset, BATCH_SIZE,
+    sampler=make_weighted_sampler(y_train),
+    num_workers=NUM_WORKERS, pin_memory=True)
+val_loader   = DataLoader(val_dataset, BATCH_SIZE,
+    shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+test_loader  = DataLoader(test_dataset, BATCH_SIZE,
+    shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+
+
+# ============================================================
+# NEW BCAF ARCHITECTURE (matches Step 3 Cells 1, 2)
+# ============================================================
+
+class CrossAttention(nn.Module):
+    """Real cross-attention on token sequences (Lesson 4 fix)."""
+    def __init__(self, dim, num_heads=8, dropout=0.1):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim  = dim // num_heads
+        self.scale     = self.head_dim ** -0.5
+
+        self.q_eff  = nn.Linear(dim, dim)
+        self.k_swin = nn.Linear(dim, dim)
+        self.v_swin = nn.Linear(dim, dim)
+        self.q_swin = nn.Linear(dim, dim)
+        self.k_eff  = nn.Linear(dim, dim)
+        self.v_eff  = nn.Linear(dim, dim)
+
+        self.out_proj = nn.Sequential(
+            nn.Linear(dim*2, dim*2), nn.LayerNorm(dim*2),
+            nn.GELU(), nn.Dropout(dropout))
+        self.dropout = nn.Dropout(dropout)
+
+    def attention(self, q, k, v):
+        B, N, _ = q.shape
+        H, D = self.num_heads, self.head_dim
+        q = q.view(B, N, H, D).transpose(1, 2)
+        k = k.view(B, N, H, D).transpose(1, 2)
+        v = v.view(B, N, H, D).transpose(1, 2)
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = self.dropout(torch.softmax(attn, dim=-1))
+        out = attn @ v
+        return out.transpose(1, 2).reshape(B, N, H * D)
+
+    def forward(self, eff_tokens, swin_tokens):
+        eff_attended  = self.attention(self.q_eff(eff_tokens),
+            self.k_swin(swin_tokens), self.v_swin(swin_tokens))
+        swin_attended = self.attention(self.q_swin(swin_tokens),
+            self.k_eff(eff_tokens), self.v_eff(eff_tokens))
+        return self.out_proj(torch.cat([eff_attended, swin_attended], dim=-1))
+
+
+EFF_FEATURES, SWIN_FEATURES, FUSION_DIM = 1280, 768, 512
+CONCAT_DIM = FUSION_DIM * 2
+
+class HybridDatePalmModel(nn.Module):
+    def __init__(self, num_classes=9):
+        super().__init__()
+        self.efficientnet = timm.create_model(
+            'tf_efficientnetv2_s', pretrained=True, num_classes=0)
+        self.swin = timm.create_model(
+            'swin_tiny_patch4_window7_224', pretrained=True, num_classes=0)
+
+        self.eff_proj = nn.Sequential(
+            nn.Conv2d(EFF_FEATURES, FUSION_DIM, 1), nn.BatchNorm2d(FUSION_DIM),
+            nn.ReLU(), nn.Dropout2d(0.3))
+        self.swin_proj = nn.Sequential(
+            nn.Conv2d(SWIN_FEATURES, FUSION_DIM, 1), nn.BatchNorm2d(FUSION_DIM),
+            nn.ReLU(), nn.Dropout2d(0.3))
+
+        self.cross_attention = CrossAttention(dim=FUSION_DIM, num_heads=8, dropout=0.1)
+
+        self.classifier = nn.Sequential(
+            nn.Linear(CONCAT_DIM, 512), nn.BatchNorm1d(512),
+            nn.ReLU(), nn.Dropout(0.4),
+            nn.Linear(512, 256), nn.ReLU(),
+            nn.Dropout(0.3), nn.Linear(256, num_classes))
+
+    def forward(self, x):
+        e_map = self.efficientnet.forward_features(x)
+        s_map = self.swin.forward_features(x)
+        s_map = s_map.permute(0, 3, 1, 2).contiguous()
+        e_map = self.eff_proj(e_map)
+        s_map = self.swin_proj(s_map)
+        B, C, H, W = e_map.shape
+        e_tokens = e_map.flatten(2).transpose(1, 2)
+        s_tokens = s_map.flatten(2).transpose(1, 2)
+        fused_tokens = self.cross_attention(e_tokens, s_tokens)
+        fused_vec = fused_tokens.mean(dim=1)
+        return self.classifier(fused_vec)
+
+
+# ── Instantiate model ──────────────────────────────────────
+model = HybridDatePalmModel(NUM_CLASSES).to(DEVICE)
+
+# ── Try to load saved weights (only works if NEW BCAF model exists) ──
+if os.path.exists(SAVE_PATH):
+    try:
+        model.load_state_dict(torch.load(SAVE_PATH, map_location=DEVICE))
+        model.eval()
+        print(f"✅ Loaded existing model from {SAVE_PATH}")
+        model_loaded = True
+    except RuntimeError as e:
+        print(f"⚠️  Could NOT load {SAVE_PATH} — saved weights don't match new architecture.")
+        print(f"    This means EffSwin.pth is from the OLD broken model.")
+        print(f"    You need to RETRAIN (run Step 4 cells) to get a working new model.")
+        print(f"    Model is currently using ImageNet pretrained backbones (untrained on dataset).")
+        model_loaded = False
+else:
+    print(f"⚠️  No saved model found at {SAVE_PATH}")
+    print(f"    Model is using ImageNet pretrained backbones (untrained on dataset).")
+    print(f"    You need to train (run Step 4 cells) before evaluating.")
+    model_loaded = False
+
+print("="*60)
+print("✅ QUICK RESTART COMPLETE (v2 BCAF)")
+print(f"   Device       : {DEVICE}")
+print(f"   Architecture : New BCAF (feature-map fusion)")
+print(f"   Train images : {len(train_dataset)}")
+print(f"   Val images   : {len(val_dataset)}")
+print(f"   Test images  : {len(test_dataset)}")
+print(f"   Save target  : {SAVE_PATH}")
+print(f"   Model status : {'TRAINED ✅' if model_loaded else 'UNTRAINED ⚠️ — run Step 4'}")
+print("="*60)
+
+# STEP 1 — CELL 1: Mount Drive & Install Libraries
+# ============================================================
+from google.colab import drive
+drive.mount('/content/drive')
+
+
+!pip install timm -q
+!pip install torchinfo -q
+!pip install grad-cam -q
+
+print("✅ All libraries installed!")
+
+# ============================================================
+# STEP 1 — CELL 2: All Imports
+# ============================================================
+import os
+import random
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
+import warnings
+warnings.filterwarnings("ignore")
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+import torchvision.transforms as transforms
+import timm
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (classification_report,
+                             confusion_matrix)
+import seaborn as sns
+from torchinfo import summary
+
+print("✅ All imports done!")
+
+# ============================================================
+# STEP 1 — CELL 3: Config & Paths
+# ============================================================
+
+# ── Reproducibility ────────────────────────────────────────
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
+
+# ── Device ─────────────────────────────────────────────────
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# ── Paths ──────────────────────────────────────────────────
+DATASET_ROOT   = '/content/dataset/Diseases of date palm leaves dataset/Infected Date Palm Leaves Dataset'
+PROCESSED_PATH = '/content/dataset/Diseases of date palm leaves dataset/Infected Date Palm Leaves Dataset/Processed'
+RAW_PATH       = f'{DATASET_ROOT}/Raw'
+
+GP1_PATH     = '/content/drive/MyDrive/GP1'
+MODEL_PATH   = f'{GP1_PATH}/Model'
+PLOTS_PATH   = f'{GP1_PATH}/Plots'
+RESULTS_PATH = f'{GP1_PATH}/Results'
+SAVE_PATH    = f'{MODEL_PATH}/EffSwin.pth'
+
+# ── Add RAW_PATH to config ─────────────────────────────────
+RAW_PATH = '/content/drive/MyDrive/CSC496/dataset/Diseases of date palm leaves dataset/Infected Date Palm Leaves Dataset/Raw'
+
+print("✅ RAW_PATH defined!")
+print(f"   {RAW_PATH}")
+
+
+# ── Create output folders ──────────────────────────────────
+for path in [MODEL_PATH, PLOTS_PATH, RESULTS_PATH]:
+    os.makedirs(path, exist_ok=True)
+
+# ── Hyperparameters ────────────────────────────────────────
+IMG_SIZE    = 224
+BATCH_SIZE  = 32
+NUM_CLASSES = 9
+NUM_WORKERS = 2
+NUM_EPOCHS  = 30
+
+# ── Class names ────────────────────────────────────────────
+CLASS_NAMES = [
+    '1. Potassium Deficiency',
+    '2. Manganese Deficiency',
+    '3. Magnesium Deficiency',
+    '4. Black Scorch',
+    '5. Leaf Spots',
+    '6. Fusarium Wilt',
+    '7. Rachis Blight',
+    '8. Parlatoria Blanchardi',
+    '9. Healthy sample'
+]
+CLASS_TO_IDX = {cls: idx for idx, cls in enumerate(CLASS_NAMES)}
+SHORT_NAMES  = [c.split('. ')[1] for c in CLASS_NAMES]
+
+print("✅ Config ready!")
+print(f"   Device     : {DEVICE}")
+print(f"   Image size : {IMG_SIZE}×{IMG_SIZE}")
+print(f"   Batch size : {BATCH_SIZE}")
+print(f"   Classes    : {NUM_CLASSES}")
+print(f"   Save path  : {SAVE_PATH}")
+
+# ============================================================
+# EXTRACT DATASET to local Colab disk (fast I/O for training)
+# ============================================================
+import zipfile, os, time
+
+ZIP_PATH    = '/content/drive/MyDrive/CSC496/Diseases of date palm leaves dataset.zip'
+EXTRACT_DIR = '/content/dataset'
+
+# Check if already extracted (skip if so)
+if os.path.exists(EXTRACT_DIR) and len(os.listdir(EXTRACT_DIR)) > 0:
+    print(f"✅ Already extracted at {EXTRACT_DIR} — skipping")
+else:
+    os.makedirs(EXTRACT_DIR, exist_ok=True)
+    t0 = time.time()
+    print("📦 Extracting (this may take 3-5 minutes for 1 GB)...")
+    with zipfile.ZipFile(ZIP_PATH, 'r') as z:
+        z.extractall(EXTRACT_DIR)
+    print(f"✅ Done in {time.time()-t0:.1f}s\n")
+
+# Inspect what was extracted
+print("📂 Top-level contents of extraction:")
+for item in sorted(os.listdir(EXTRACT_DIR)):
+    full = os.path.join(EXTRACT_DIR, item)
+    kind = "DIR " if os.path.isdir(full) else "FILE"
+    print(f"   [{kind}] {item}")
+
+# ============================================================
+# STEP 2 — CELL 1: Collect Paths & Split 70/15/15
+# ============================================================
+
+all_images, all_labels = [], []
+
+for cls in CLASS_NAMES:
+    cls_path = os.path.join(PROCESSED_PATH, cls)
+    for img_file in os.listdir(cls_path):
+        if img_file.lower().endswith(('.jpg','.jpeg','.png')):
+            all_images.append(os.path.join(cls_path, img_file))
+            all_labels.append(CLASS_TO_IDX[cls])
+
+print(f"📊 Total images: {len(all_images)}\n")
+
+# ── Class distribution ─────────────────────────────────────
+print("📂 Class distribution:")
+for cls in CLASS_NAMES:
+    count = all_labels.count(CLASS_TO_IDX[cls])
+    bar   = '█' * (count // 30)
+    print(f"   {cls:<35} {count:>4} {bar}")
+
+# ── Stratified split 70/15/15 ──────────────────────────────
+X_train, X_temp, y_train, y_temp = train_test_split(
+    all_images, all_labels,
+    test_size=0.30,
+    stratify=all_labels,
+    random_state=SEED
+)
+X_val, X_test, y_val, y_test = train_test_split(
+    X_temp, y_temp,
+    test_size=0.50,
+    stratify=y_temp,
+    random_state=SEED
+)
+
+print(f"\n✅ Split complete:")
+print(f"   Train : {len(X_train)} images (70%)")
+print(f"   Val   : {len(X_val)}   images (15%)")
+print(f"   Test  : {len(X_test)}  images (15%)")
+
+# ============================================================
+# STEP 2 — CELL 2: Transforms
+# ============================================================
+
+# ── Training: light augmentation ──────────────────────────
+train_transform = transforms.Compose([
+    transforms.RandomResizedCrop(IMG_SIZE, scale=(0.85, 1.0)),
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomVerticalFlip(p=0.3),
+    transforms.RandomRotation(degrees=30),
+    transforms.ColorJitter(
+        brightness=0.2, contrast=0.2,
+        saturation=0.1, hue=0.05
+    ),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std =[0.229, 0.224, 0.225]
+    )
+])
+
+# ── Val/Test: no augmentation ──────────────────────────────
+val_test_transform = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std =[0.229, 0.224, 0.225]
+    )
+])
+
+print("✅ Transforms defined!")
+print("   Train : resize + flip + rotate + color jitter + normalize")
+print("   Val   : resize + normalize only")
+print("   Test  : resize + normalize only")
+
+# ============================================================
+# STEP 2 — CELL 3 (v2): Dataset Class & DataLoaders
+# ============================================================
+# NOTE (v2 fix): We keep the WeightedRandomSampler for class
+# imbalance and REMOVE the weighted loss in Step 4 Cell 1.
+# Using both was double-counting imbalance and contributed
+# to the 100% confidence problem.
+# ============================================================
+
+class DatePalmDataset(Dataset):
+    def __init__(self, image_paths, labels, transform=None):
+        self.image_paths = image_paths
+        self.labels      = labels
+        self.transform   = transform
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img = Image.open(
+            self.image_paths[idx]).convert('RGB')
+        if self.transform:
+            img = self.transform(img)
+        return img, self.labels[idx]
+
+
+# ── Weighted sampler for class imbalance ───────────────────
+def make_weighted_sampler(labels):
+    class_counts  = np.bincount(labels)
+    class_weights = 1.0 / class_counts
+    sample_weights = [class_weights[l] for l in labels]
+    return WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True
+    )
+
+# ── Build datasets ─────────────────────────────────────────
+train_dataset = DatePalmDataset(
+    X_train, y_train, train_transform)
+val_dataset   = DatePalmDataset(
+    X_val,   y_val,   val_test_transform)
+test_dataset  = DatePalmDataset(
+    X_test,  y_test,  val_test_transform)
+
+# ── Build dataloaders ──────────────────────────────────────
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=BATCH_SIZE,
+    sampler=make_weighted_sampler(y_train),
+    num_workers=NUM_WORKERS,
+    pin_memory=True
+)
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    num_workers=NUM_WORKERS,
+    pin_memory=True
+)
+test_loader = DataLoader(
+    test_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    num_workers=NUM_WORKERS,
+    pin_memory=True
+)
+
+print("✅ Datasets & DataLoaders ready! (v2)")
+print(f"   Train batches : {len(train_loader)}")
+print(f"   Val batches   : {len(val_loader)}")
+print(f"   Test batches  : {len(test_loader)}")
+
+# ============================================================
+# STEP 2 — CELL 4: Visualize Sample Training Batch
+# ============================================================
+
+def unnormalize(tensor):
+    img = tensor.numpy().transpose((1, 2, 0))
+    img = img * np.array([0.229, 0.224, 0.225]) + \
+               np.array([0.485, 0.456, 0.406])
+    return np.clip(img, 0, 1)
+
+images, labels = next(iter(train_loader))
+
+fig, axes = plt.subplots(2, 8, figsize=(20, 6))
+fig.suptitle('Sample Training Batch (after augmentation)',
+             fontsize=13, fontweight='bold')
+
+for i, ax in enumerate(axes.flatten()):
+    if i < len(images):
+        ax.imshow(unnormalize(images[i]))
+        ax.set_title(SHORT_NAMES[labels[i]][:12],
+                     fontsize=7)
+        ax.axis('off')
+
+plt.tight_layout()
+plt.savefig(f'{PLOTS_PATH}/sample_batch.png', dpi=150)
+plt.show()
+print("✅ Sample batch visualized!")
+
+# ============================================================
+# STEP 3 — CELL 1 (REWRITTEN): CrossAttention for feature maps
+# ============================================================
+# This operates on sequences of tokens (49 per branch)
+# instead of flat pooled vectors.
+
+class CrossAttention(nn.Module):
+    """
+    Bidirectional Cross-Attention for sequences of tokens
+    derived from feature maps. Each token represents one
+    spatial position from the 7x7 final feature map.
+    """
+    def __init__(self, dim, num_heads=8, dropout=0.1):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim  = dim // num_heads
+        self.scale     = self.head_dim ** -0.5
+
+        # EfficientNet branch attends to Swin
+        self.q_eff  = nn.Linear(dim, dim)
+        self.k_swin = nn.Linear(dim, dim)
+        self.v_swin = nn.Linear(dim, dim)
+
+        # Swin branch attends to EfficientNet
+        self.q_swin = nn.Linear(dim, dim)
+        self.k_eff  = nn.Linear(dim, dim)
+        self.v_eff  = nn.Linear(dim, dim)
+
+        # Output projection (operates per token)
+        self.out_proj = nn.Sequential(
+            nn.Linear(dim * 2, dim * 2),
+            nn.LayerNorm(dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+    def attention(self, q, k, v):
+        """
+        Real multi-head scaled dot-product attention.
+        q, k, v: (B, N, dim) where N is the number of tokens.
+        returns:  (B, N, dim)
+        """
+        B, N, _ = q.shape
+        H, D = self.num_heads, self.head_dim
+
+        # Reshape: (B, N, dim) → (B, H, N, D)
+        q = q.view(B, N, H, D).transpose(1, 2)
+        k = k.view(B, N, H, D).transpose(1, 2)
+        v = v.view(B, N, H, D).transpose(1, 2)
+
+        # Attention scores: (B, H, N, N)
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = self.dropout(torch.softmax(attn, dim=-1))
+
+        # Weighted values: (B, H, N, D)
+        out = attn @ v
+
+        # Merge heads: (B, H, N, D) → (B, N, H*D)
+        out = out.transpose(1, 2).reshape(B, N, H * D)
+        return out
+
+    def forward(self, eff_tokens, swin_tokens):
+        """
+        eff_tokens, swin_tokens: (B, N, dim)
+        returns: (B, N, 2*dim)
+        """
+        # Direction 1: EfficientNet queries Swin
+        eff_attended = self.attention(
+            self.q_eff(eff_tokens),
+            self.k_swin(swin_tokens),
+            self.v_swin(swin_tokens))
+
+        # Direction 2: Swin queries EfficientNet
+        swin_attended = self.attention(
+            self.q_swin(swin_tokens),
+            self.k_eff(eff_tokens),
+            self.v_eff(eff_tokens))
+
+        # Concatenate along channel dim
+        fused = torch.cat([eff_attended, swin_attended], dim=-1)
+        return self.out_proj(fused)
+
+
+print("✅ New CrossAttention defined (operates on token sequences)")
+
+# ============================================================
+# STEP 3 — CELL 2 (REWRITTEN): HybridDatePalmModel with feature-map BCAF
+# ============================================================
+
+EFF_FEATURES  = 1280
+SWIN_FEATURES = 768
+FUSION_DIM    = 512
+CONCAT_DIM    = FUSION_DIM * 2   # 1024
+
+class HybridDatePalmModel(nn.Module):
+    def __init__(self, num_classes=9):
+        super().__init__()
+
+        # Branch A: EfficientNetV2-S
+        self.efficientnet = timm.create_model(
+            'tf_efficientnetv2_s', pretrained=True, num_classes=0)
+
+        # Branch B: Swin-Tiny
+        self.swin = timm.create_model(
+            'swin_tiny_patch4_window7_224', pretrained=True, num_classes=0)
+
+        # Projections — now 1x1 convs to preserve spatial structure
+        self.eff_proj = nn.Sequential(
+            nn.Conv2d(EFF_FEATURES, FUSION_DIM, kernel_size=1),
+            nn.BatchNorm2d(FUSION_DIM),
+            nn.ReLU(),
+            nn.Dropout2d(0.3)
+        )
+        self.swin_proj = nn.Sequential(
+            nn.Conv2d(SWIN_FEATURES, FUSION_DIM, kernel_size=1),
+            nn.BatchNorm2d(FUSION_DIM),
+            nn.ReLU(),
+            nn.Dropout2d(0.3)
+        )
+
+        # Bidirectional cross-attention (now operates on tokens)
+        self.cross_attention = CrossAttention(
+            dim=FUSION_DIM, num_heads=8, dropout=0.1)
+
+        # Classifier head — unchanged
+        self.classifier = nn.Sequential(
+            nn.Linear(CONCAT_DIM, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, x):
+        # 1. Extract feature maps (skip pooling)
+        e_map = self.efficientnet.forward_features(x)   # (B, 1280, 7, 7)
+        s_map = self.swin.forward_features(x)           # (B, 7, 7, 768)
+        s_map = s_map.permute(0, 3, 1, 2).contiguous()  # (B, 768, 7, 7)
+
+        # 2. Project to common channel dim
+        e_map = self.eff_proj(e_map)    # (B, 512, 7, 7)
+        s_map = self.swin_proj(s_map)   # (B, 512, 7, 7)
+
+        # 3. Flatten spatial → token sequence
+        B, C, H, W = e_map.shape
+        e_tokens = e_map.flatten(2).transpose(1, 2)   # (B, 49, 512)
+        s_tokens = s_map.flatten(2).transpose(1, 2)   # (B, 49, 512)
+
+        # 4. Bidirectional cross-attention
+        fused_tokens = self.cross_attention(e_tokens, s_tokens)  # (B, 49, 1024)
+
+        # 5. Pool over tokens for classifier
+        fused_vec = fused_tokens.mean(dim=1)  # (B, 1024)
+
+        return self.classifier(fused_vec)
+
+
+print("✅ HybridDatePalmModel rewritten")
+print("   Feature maps preserved through fusion")
+print("   Cross-attention now operates on 49 spatial tokens per branch")
+
+# ============================================================
+# STEP 3 — CELL 3 (REWRITTEN): Instantiate, verify, inspect shapes
+# ============================================================
+
+model = HybridDatePalmModel(num_classes=NUM_CLASSES).to(DEVICE)
+
+# Quick forward pass
+dummy = torch.randn(2, 3, 224, 224).to(DEVICE)
+with torch.no_grad():
+    out = model(dummy)
+
+print(f"✅ Forward pass successful!")
+print(f"   Input  : (2, 3, 224, 224)")
+print(f"   Output : {tuple(out.shape)}  ← should be (2, 9)")
+
+# Detailed shape trace using hooks
+print("\n🔍 Internal shape progression (sanity check):\n")
+
+shapes = {}
+def make_hook(name):
+    def hook(m, i, o):
+        if isinstance(o, torch.Tensor):
+            shapes[name] = tuple(o.shape)
+    return hook
+
+h1 = model.eff_proj.register_forward_hook(make_hook('eff_proj output'))
+h2 = model.swin_proj.register_forward_hook(make_hook('swin_proj output'))
+h3 = model.cross_attention.register_forward_hook(make_hook('cross_attention output'))
+
+with torch.no_grad():
+    _ = model(dummy)
+
+h1.remove(); h2.remove(); h3.remove()
+
+for name, shape in shapes.items():
+    print(f"   {name:<25}: {shape}")
+
+# Parameter count
+total = sum(p.numel() for p in model.parameters())
+trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"\n📊 Parameters:")
+print(f"   Total     : {total:,}")
+print(f"   Trainable : {trainable:,}")
+
+# ============================================================
+# See real cross-attention from the new fused model
+# ============================================================
+
+model.eval()
+
+# Pick a real test image
+sample_path = X_test[0]
+sample_label = y_test[0]
+img = Image.open(sample_path).convert('RGB')
+img_tensor = val_test_transform(img).unsqueeze(0).to(DEVICE)
+
+# Capture attention weights by wrapping the attention method
+captured_attn = {}
+original_attn = model.cross_attention.attention
+
+def attention_with_capture(q, k, v):
+    B, N, _ = q.shape
+    H = model.cross_attention.num_heads
+    D = model.cross_attention.head_dim
+    q_ = q.view(B, N, H, D).transpose(1, 2)
+    k_ = k.view(B, N, H, D).transpose(1, 2)
+    v_ = v.view(B, N, H, D).transpose(1, 2)
+    attn = (q_ @ k_.transpose(-2, -1)) * model.cross_attention.scale
+    attn = torch.softmax(attn, dim=-1)
+    captured_attn['weights'] = attn.detach()
+    out = attn @ v_
+    return out.transpose(1, 2).reshape(B, N, H * D)
+
+model.cross_attention.attention = attention_with_capture
+
+with torch.no_grad():
+    _ = model(img_tensor)
+
+model.cross_attention.attention = original_attn  # restore
+
+# Visualize: average across heads
+attn_matrix = captured_attn['weights'][0].mean(dim=0).cpu().numpy()  # (49, 49)
+
+plt.figure(figsize=(9, 8))
+plt.imshow(attn_matrix, cmap='hot', aspect='auto')
+plt.colorbar(label='Attention weight')
+plt.title(f'Real Cross-Attention Matrix (untrained model)\nClass: {SHORT_NAMES[sample_label]}')
+plt.xlabel('Key positions (0-48 = 7x7 grid)')
+plt.ylabel('Query positions (0-48 = 7x7 grid)')
+plt.tight_layout()
+plt.savefig(f'{PLOTS_PATH}/lesson4_real_attention.png', dpi=150)
+plt.show()
+
+print(f"\n✅ Real attention matrix captured!")
+print(f"   Shape: {attn_matrix.shape}")
+print(f"   Max weight: {attn_matrix.max():.3f}")
+print(f"   Min weight: {attn_matrix.min():.3f}")
+print(f"   First 3 rows sum to ~1.0: {attn_matrix.sum(axis=1)[:3].round(3)}")
+print(f"\n⚠️  NOTE: This model is NOT YET TRAINED on your new architecture.")
+print(f"    The attention pattern is currently random/noisy.")
+
+# ============================================================
+# STEP 4 — CELL 1 (REVISED): Loss, optimizer & scheduler
+# ============================================================
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+# Loss: label-smoothed cross-entropy (no class weighting)
+criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+
+# Optimizer: AdamW with differential learning rates
+optimizer = AdamW([
+    {'params': model.efficientnet.parameters(), 'lr': 1e-4},
+    {'params': model.swin.parameters(),         'lr': 1e-4},
+    {'params': model.eff_proj.parameters(),     'lr': 1e-4},
+    {'params': model.swin_proj.parameters(),    'lr': 1e-4},
+    {'params': model.cross_attention.parameters(), 'lr': 1e-4},
+    {'params': model.classifier.parameters(),   'lr': 1e-4},
+], weight_decay=1e-4)
+
+scheduler = CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
+
+print("✅ Loss, optimizer & scheduler ready!")
+
+# ============================================================
+# STEP 4 — CELL 2 (v2): Early Stopping
+# ============================================================
+# Change for v2: patience increased 7 → 10 because the new
+# model trains more noisily in early epochs with label smoothing.
+# ============================================================
+
+class EarlyStopping:
+    def __init__(self, patience=10, min_delta=0.001):
+        self.patience    = patience
+        self.min_delta   = min_delta
+        self.counter     = 0
+        self.best_acc    = 0.0
+        self.best_loss   = float('inf')
+        self.should_stop = False
+
+    def __call__(self, val_loss, val_acc,
+                 model, path):
+        if val_acc > self.best_acc + self.min_delta:
+            self.best_acc  = val_acc
+            self.best_loss = val_loss
+            self.counter   = 0
+            torch.save(model.state_dict(), path)
+            print(f"   💾 Best model saved! "
+                  f"(val_acc={val_acc*100:.2f}%)")
+        else:
+            self.counter += 1
+            print(f"   ⏳ No improvement "
+                  f"({self.counter}/{self.patience})")
+            if self.counter >= self.patience:
+                self.should_stop = True
+                print(f"   🛑 Early stopping triggered!")
+
+early_stopping = EarlyStopping(patience=10, min_delta=0.001)
+print("✅ Early stopping ready! (patience=10)")
+
+# ============================================================
+# STEP 4 — CELL 3 (v2): Train & Validate Functions
+# ============================================================
+# Change for v2: validate() now returns per-class accuracy
+# so we can spot classes being neglected during training.
+# ============================================================
+
+def train_one_epoch(model, loader, optimizer,
+                    criterion, device):
+    model.train()
+    total_loss, correct, total = 0.0, 0, 0
+
+    for batch_idx, (images, labels) in enumerate(loader):
+        images  = images.to(device)
+        labels  = labels.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss    = criterion(outputs, labels)
+        loss.backward()
+
+        nn.utils.clip_grad_norm_(
+            model.parameters(), max_norm=1.0)
+
+        optimizer.step()
+
+        total_loss += loss.item()
+        _, predicted = outputs.max(1)
+        correct += predicted.eq(labels).sum().item()
+        total   += labels.size(0)
+
+        if (batch_idx + 1) % 20 == 0:
+            print(f"      Batch [{batch_idx+1}/"
+                  f"{len(loader)}] "
+                  f"Loss: {loss.item():.4f}")
+
+    return total_loss / len(loader), correct / total
+
+
+def validate(model, loader, criterion, device,
+             num_classes=NUM_CLASSES):
+    model.eval()
+    total_loss, correct, total = 0.0, 0, 0
+    class_correct = torch.zeros(num_classes)
+    class_total   = torch.zeros(num_classes)
+
+    with torch.no_grad():
+        for images, labels in loader:
+            images  = images.to(device)
+            labels  = labels.to(device)
+            outputs = model(images)
+            loss    = criterion(outputs, labels)
+
+            total_loss += loss.item()
+            _, predicted = outputs.max(1)
+            correct += predicted.eq(labels).sum().item()
+            total   += labels.size(0)
+
+            # ── Per-class accuracy tracking ──
+            for c in range(num_classes):
+                mask = labels == c
+                class_correct[c] += \
+                    predicted[mask].eq(labels[mask]).sum().item()
+                class_total[c]   += mask.sum().item()
+
+    per_class_acc = (
+        class_correct / class_total.clamp(min=1)
+    ).tolist()
+
+    return (total_loss / len(loader),
+            correct / total,
+            per_class_acc)
+
+
+print("✅ Train & validate functions ready! (v2)")
+
+# ============================================================
+# STEP 4 — CELL 4 (v2): Run Training Loop
+# ============================================================
+# Changes for v2:
+#   • Clearer "BCAF v2" label in logs
+#   • Prints per-class val accuracy every epoch
+# ============================================================
+
+history = {
+    'train_loss': [], 'train_acc': [],
+    'val_loss'  : [], 'val_acc'  : [],
+    'per_class_acc': []
+}
+
+print("🚀 Starting training with BCAF v2 "
+      "(feature-map cross-attention)...\n")
+print("=" * 60)
+
+for epoch in range(NUM_EPOCHS):
+    print(f"\n📅 Epoch [{epoch+1}/{NUM_EPOCHS}]")
+    print(f"   LR: {optimizer.param_groups[0]['lr']:.2e}")
+
+    train_loss, train_acc = train_one_epoch(
+        model, train_loader, optimizer, criterion, DEVICE)
+
+    val_loss, val_acc, per_class_acc = validate(
+        model, val_loader, criterion, DEVICE)
+
+    scheduler.step()
+
+    history['train_loss'].append(train_loss)
+    history['train_acc'].append(train_acc)
+    history['val_loss'].append(val_loss)
+    history['val_acc'].append(val_acc)
+    history['per_class_acc'].append(per_class_acc)
+
+    print(f"   Train Loss: {train_loss:.4f} | "
+          f"Train Acc: {train_acc*100:.2f}%")
+    print(f"   Val Loss:   {val_loss:.4f}  | "
+          f"Val Acc:   {val_acc*100:.2f}%")
+
+    # ── Per-class val accuracy ──
+    print(f"   Per-class val acc:")
+    for cls_name, acc in zip(CLASS_NAMES, per_class_acc):
+        flag = " ⚠️" if acc < 0.70 else ""
+        print(f"      {cls_name:<25s} {acc*100:5.2f}%{flag}")
+
+    early_stopping(val_loss, val_acc, model, SAVE_PATH)
+
+    if early_stopping.should_stop:
+        print(f"\n🛑 Stopped at epoch {epoch+1}")
+        break
+
+    print("-" * 60)
+
+print(f"\n✅ Training complete! (BCAF v2)")
+print(f"   Best Val Accuracy : "
+      f"{early_stopping.best_acc*100:.2f}%")
+print(f"   Model saved to    : {SAVE_PATH}")
+
+# to load the best saved model
+model.load_state_dict(
+    torch.load(SAVE_PATH, map_location=DEVICE))
+model.eval()
+print("✅ Best model loaded!")
+
+# ============================================================
+# STEP 4 — CELL 5 (REWRITTEN v2): Plot Training Curves
+#                                + Confidence Histogram
+# ============================================================
+
+epochs_ran = range(1, len(history['train_loss']) + 1)
+
+# ── PLOT 1: Loss & Accuracy Curves ─────────────────────────
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+fig.suptitle('Training History — BCAF v2 (Cross-Attention)',
+             fontsize=14, fontweight='bold')
+
+axes[0].plot(epochs_ran, history['train_loss'],
+             'b-o', label='Train Loss', markersize=4)
+axes[0].plot(epochs_ran, history['val_loss'],
+             'r-o', label='Val Loss',   markersize=4)
+axes[0].set_title('Loss')
+axes[0].set_xlabel('Epoch')
+axes[0].set_ylabel('Loss')
+axes[0].legend()
+axes[0].grid(True)
+
+axes[1].plot(epochs_ran,
+             [a*100 for a in history['train_acc']],
+             'b-o', label='Train Acc', markersize=4)
+axes[1].plot(epochs_ran,
+             [a*100 for a in history['val_acc']],
+             'r-o', label='Val Acc',   markersize=4)
+axes[1].set_title('Accuracy')
+axes[1].set_xlabel('Epoch')
+axes[1].set_ylabel('Accuracy (%)')
+axes[1].legend()
+axes[1].grid(True)
+
+plt.tight_layout()
+plt.savefig(f'{PLOTS_PATH}/training_curves_bcaf_v2.png',
+            dpi=150)
+plt.show()
+print("✅ Training curves saved!")
+
+
+# ── PLOT 2: Confidence Histogram (PROOF of fix for Task B) ──
+print("\n📊 Computing validation confidence distribution...")
+
+model.eval()
+all_confidences = []
+
+with torch.no_grad():
+    for images, labels in val_loader:
+        images  = images.to(DEVICE)
+        outputs = model(images)
+        probs   = torch.softmax(outputs, dim=1)
+        max_probs, _ = probs.max(dim=1)
+        all_confidences.extend(max_probs.cpu().numpy().tolist())
+
+mean_conf   = np.mean(all_confidences)
+median_conf = np.median(all_confidences)
+
+plt.figure(figsize=(9, 5))
+plt.hist(all_confidences, bins=30,
+         edgecolor='black', color='steelblue', alpha=0.85)
+plt.axvline(x=0.9, color='red', linestyle='--',
+            linewidth=2,
+            label='Label smoothing ceiling (~0.9)')
+plt.axvline(x=mean_conf, color='green', linestyle='-',
+            linewidth=2,
+            label=f'Mean = {mean_conf:.3f}')
+plt.title('Validation Confidence Distribution — BCAF v2',
+          fontsize=13, fontweight='bold')
+plt.xlabel('Max Softmax Probability')
+plt.ylabel('Number of Samples')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig(f'{PLOTS_PATH}/confidence_histogram_v2.png',
+            dpi=150)
+plt.show()
+
+print(f"✅ Confidence histogram saved!")
+print(f"   Mean confidence   : {mean_conf:.4f}")
+print(f"   Median confidence : {median_conf:.4f}")
+print(f"   Max confidence    : {max(all_confidences):.4f}")
+print(f"   Min confidence    : {min(all_confidences):.4f}")
+
+if max(all_confidences) > 0.95:
+    print("\n⚠️  Some predictions still above 0.95 — "
+          "consider label_smoothing=0.15")
+else:
+    print("\n🎯 Confidence problem FIXED — "
+          "no predictions above 0.95!")
+# ============================================================
+# STEP 5 — CELL 1: Load Best Model & Test
+# ============================================================
+
+model.load_state_dict(
+    torch.load(SAVE_PATH, map_location=DEVICE))
+model.eval()
+
+all_preds, all_labels_list = [], []
+
+with torch.no_grad():
+    for batch_idx, (images, labels) in enumerate(
+            test_loader):
+        images  = images.to(DEVICE)
+        outputs = model(images)
+        _, predicted = outputs.max(1)
+        all_preds.extend(predicted.cpu().numpy())
+        all_labels_list.extend(labels.numpy())
+        print(f"   Batch [{batch_idx+1}/"
+              f"{len(test_loader)}] ✅")
+
+all_preds       = np.array(all_preds)
+all_labels_list = np.array(all_labels_list)
+
+test_acc = (all_preds == all_labels_list).mean() * 100
+print(f"\n🎯 Test Accuracy: {test_acc:.2f}%\n")
+
+print(classification_report(
+    all_labels_list, all_preds,
+    target_names=SHORT_NAMES,
+    digits=4
+))
+
+# ============================================================
+# STEP 5 — CELL 2: Confusion Matrix
+# ============================================================
+
+cm = confusion_matrix(all_labels_list, all_preds)
+
+plt.figure(figsize=(12, 10))
+sns.heatmap(
+    cm,
+    annot=True,
+    fmt='d',
+    cmap='Blues',
+    xticklabels=SHORT_NAMES,
+    yticklabels=SHORT_NAMES,
+    linewidths=0.5
+)
+plt.title(f'Confusion Matrix — Test Set '
+          f'({test_acc:.2f}%)',
+          fontsize=14, fontweight='bold', pad=15)
+plt.ylabel('True Label',      fontsize=12)
+plt.xlabel('Predicted Label', fontsize=12)
+plt.xticks(rotation=45, ha='right', fontsize=9)
+plt.yticks(rotation=0,           fontsize=9)
+plt.tight_layout()
+plt.savefig(f'{PLOTS_PATH}/confusion_matrix_cbam.png',
+            dpi=150)
+plt.show()
+print("✅ Confusion matrix saved!")
+
+# ============================================================
+# RELOAD trained weights, THEN run confidence gallery
+# ============================================================
+import torch
+
+# Reload best checkpoint into the current model
+model.load_state_dict(torch.load(SAVE_PATH, map_location=DEVICE))
+model.eval()
+print(f"✅ Trained weights reloaded from {SAVE_PATH}")
+
+# Now run the confidence gallery cell again — same code as before
+# (everything below is the same code I gave you, just rerun it)
+
+import matplotlib.pyplot as plt
+import numpy as np
+from PIL import Image
+
+all_results = []
+
+with torch.no_grad():
+    for batch_idx, (images, labels) in enumerate(test_loader):
+        images = images.to(DEVICE)
+        outputs = model(images)
+        probs = torch.softmax(outputs, dim=1)
+        max_probs, preds = probs.max(dim=1)
+
+        for i in range(len(images)):
+            global_idx = batch_idx * BATCH_SIZE + i
+            if global_idx >= len(X_test):
+                break
+            all_results.append({
+                'image_path': X_test[global_idx],
+                'true_label': int(labels[i].item()),
+                'predicted': int(preds[i].item()),
+                'confidence': float(max_probs[i].item()),
+                'all_probs': probs[i].cpu().numpy(),
+            })
+
+sorted_by_conf = sorted(all_results, key=lambda x: x['confidence'], reverse=True)
+top_confident = sorted_by_conf[:4]
+least_confident = sorted_by_conf[-4:][::-1]
+
+fig, axes = plt.subplots(2, 4, figsize=(18, 10))
+fig.suptitle('Model Confidence on Test Images',
+             fontsize=15, fontweight='bold', y=1.02)
+
+fig.text(0.5, 0.96, '🟢 MOST CONFIDENT predictions',
+         ha='center', fontsize=13, fontweight='bold', color='darkgreen')
+
+for i, r in enumerate(top_confident):
+    ax = axes[0, i]
+    img = Image.open(r['image_path']).convert('RGB')
+    ax.imshow(img)
+    true_name = SHORT_NAMES[r['true_label']]
+    pred_name = SHORT_NAMES[r['predicted']]
+    correct = r['true_label'] == r['predicted']
+    color = 'green' if correct else 'red'
+    mark = '✓' if correct else '✗'
+    ax.set_title(
+        f"{mark} Pred: {pred_name}\nTrue: {true_name}\n"
+        f"Confidence: {r['confidence']*100:.1f}%",
+        fontsize=10, color=color, fontweight='bold')
+    ax.axis('off')
+
+fig.text(0.5, 0.49, '🟡 LEAST CONFIDENT predictions',
+         ha='center', fontsize=13, fontweight='bold', color='darkorange')
+
+for i, r in enumerate(least_confident):
+    ax = axes[1, i]
+    img = Image.open(r['image_path']).convert('RGB')
+    ax.imshow(img)
+    true_name = SHORT_NAMES[r['true_label']]
+    pred_name = SHORT_NAMES[r['predicted']]
+    correct = r['true_label'] == r['predicted']
+    color = 'green' if correct else 'red'
+    mark = '✓' if correct else '✗'
+    ax.set_title(
+        f"{mark} Pred: {pred_name}\nTrue: {true_name}\n"
+        f"Confidence: {r['confidence']*100:.1f}%",
+        fontsize=10, color=color, fontweight='bold')
+    ax.axis('off')
+
+plt.tight_layout()
+plt.savefig(f'{PLOTS_PATH}/confidence_gallery.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+print("\n" + "="*60)
+print("📊 CONFIDENCE SUMMARY (with trained weights)")
+print("="*60)
+print(f"   Mean confidence : {np.mean([r['confidence'] for r in all_results])*100:.2f}%")
+print(f"   Highest         : {sorted_by_conf[0]['confidence']*100:.2f}%")
+print(f"   Lowest          : {sorted_by_conf[-1]['confidence']*100:.2f}%")
+print(f"   ≥85% conf       : {sum(1 for r in all_results if r['confidence'] >= 0.85)}")
+print(f"   <70% conf       : {sum(1 for r in all_results if r['confidence'] < 0.70)}")
+print("="*60)
