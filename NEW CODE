@@ -1291,3 +1291,144 @@ print(f"   Lowest          : {sorted_by_conf[-1]['confidence']*100:.2f}%")
 print(f"   ≥85% conf       : {sum(1 for r in all_results if r['confidence'] >= 0.85)}")
 print(f"   <70% conf       : {sum(1 for r in all_results if r['confidence'] < 0.70)}")
 print("="*60)
+
+# ============================================================
+# REAL CROSS-ATTENTION MATRIX — Trained Model
+# ============================================================
+# Captures the actual attention weights computed by BCAF
+# and visualizes them as a 49×49 matrix.
+# ============================================================
+
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
+
+# ── Load TRAINED model ────────────────────────────────────
+model.load_state_dict(torch.load(SAVE_PATH, map_location=DEVICE))
+model.eval()
+print("✅ Trained model loaded\n")
+
+
+def capture_attention(model, img_tensor, direction='both'):
+    """
+    Capture the real cross-attention weights from BCAF.
+
+    direction:
+      'eff_to_swin' → EfficientNet attending to Swin
+      'swin_to_eff' → Swin attending to EfficientNet
+      'both'        → average of both directions
+    """
+    model.eval()
+    captured = {'eff_to_swin': None, 'swin_to_eff': None, 'call_count': 0}
+
+    original_attn = model.cross_attention.attention
+
+    def attention_with_capture(q, k, v):
+        B, N, _ = q.shape
+        H = model.cross_attention.num_heads
+        D = model.cross_attention.head_dim
+        q_ = q.view(B, N, H, D).transpose(1, 2)
+        k_ = k.view(B, N, H, D).transpose(1, 2)
+        v_ = v.view(B, N, H, D).transpose(1, 2)
+        attn = (q_ @ k_.transpose(-2, -1)) * model.cross_attention.scale
+        attn = torch.softmax(attn, dim=-1)
+
+        # First call in forward() = eff queries swin
+        # Second call = swin queries eff
+        if captured['call_count'] == 0:
+            captured['eff_to_swin'] = attn.detach()
+        else:
+            captured['swin_to_eff'] = attn.detach()
+        captured['call_count'] += 1
+
+        out = attn @ v_
+        return out.transpose(1, 2).reshape(B, N, H * D)
+
+    # Patch
+    model.cross_attention.attention = attention_with_capture
+
+    with torch.no_grad():
+        logits = model(img_tensor)
+        probs = torch.softmax(logits, dim=1)
+
+    # Restore
+    model.cross_attention.attention = original_attn
+
+    # Average across heads
+    a1 = captured['eff_to_swin'][0].mean(dim=0).cpu().numpy()  # (49, 49)
+    a2 = captured['swin_to_eff'][0].mean(dim=0).cpu().numpy()  # (49, 49)
+
+    if direction == 'eff_to_swin':
+        return a1, probs[0]
+    elif direction == 'swin_to_eff':
+        return a2, probs[0]
+    else:
+        return (a1 + a2) / 2, probs[0]
+
+
+def plot_attention_matrix(attn_matrix, title, pred_name, pred_conf,
+                          correct, save_path=None):
+    """Plot a 49×49 attention matrix."""
+    plt.figure(figsize=(9, 8))
+    im = plt.imshow(attn_matrix, cmap='hot', aspect='auto')
+    plt.colorbar(im, label='Attention weight')
+    plt.title(
+        f'{title}\n{correct}  Predicted: {pred_name} ({pred_conf*100:.1f}%)',
+        fontsize=12, fontweight='bold'
+    )
+    plt.xlabel('Key positions (0-48 = 7×7 grid)')
+    plt.ylabel('Query positions (0-48 = 7×7 grid)')
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150)
+    plt.show()
+
+    print(f"   Max weight: {attn_matrix.max():.4f}")
+    print(f"   Min weight: {attn_matrix.min():.4f}")
+    print(f"   Range:      {attn_matrix.max() - attn_matrix.min():.4f}")
+    print(f"   Mean:       {attn_matrix.mean():.4f}\n")
+
+
+# ============================================================
+# Generate ONE real attention matrix for each class
+# ============================================================
+print("📊 Capturing real cross-attention matrices...\n")
+
+for class_idx, cls_name in enumerate(CLASS_NAMES):
+    # Find first test image of this class
+    sample_path = None
+    for path, label in zip(X_test, y_test):
+        if label == class_idx:
+            sample_path = path
+            break
+    if sample_path is None:
+        continue
+
+    # Load + preprocess
+    img = Image.open(sample_path).convert('RGB')
+    img_tensor = val_test_transform(img).unsqueeze(0).to(DEVICE)
+
+    # Capture attention (average of both directions)
+    attn_matrix, probs = capture_attention(model, img_tensor, direction='both')
+
+    # Prediction info
+    pred_idx = probs.argmax().item()
+    pred_conf = probs[pred_idx].item()
+    pred_name = SHORT_NAMES[pred_idx]
+    correct = "✅" if pred_idx == class_idx else "❌"
+
+    safe_name = cls_name.split(". ")[1].replace(" ", "_")
+    save_fp = f'{PLOTS_PATH}/real_attention_{class_idx+1}_{safe_name}.png'
+
+    print(f"🔍 Class {class_idx+1}: {SHORT_NAMES[class_idx]}")
+    plot_attention_matrix(
+        attn_matrix,
+        title=f'Real Cross-Attention Matrix — {SHORT_NAMES[class_idx]}',
+        pred_name=pred_name,
+        pred_conf=pred_conf,
+        correct=correct,
+        save_path=save_fp
+    )
+
+print("✅ Done! All real attention matrices saved to:", PLOTS_PATH)
